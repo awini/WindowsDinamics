@@ -5,29 +5,28 @@ import pyaudio
 import wave
 import random
 
+from PyQt4.QtNetwork import QTcpSocket
+
 from CuOgg import *
 from CuVorbis import *
 
-#SEND_BYTES_SIZE = 172L
-#CHUNK = 32
-SEND_BYTES_SIZE = 4140L
 CHUNK = 1024
 
 FORMAT = pyaudio.paInt16
 CHANNELS = 2
 RATE = 44100
-RECORD_SECONDS = 2 # 2 seconds for debug purposes. Originally: 0
-WAVE_OUTPUT_FILENAME = "output.ogg"
+QUALITY = -0.1 # values between -0.1 (bad) to 1.0 (good)
 
 class WaveRecorder(object):
-    def __init__(self):
+    def __init__(self, sock):
+        self.sock = QTcpSocket()
+        self.sock.setSocketDescriptor(sock)
         self.data = []
         self.device = None
         self.head = False
         self.p = False
         self.stream = False
         self.i = 0
-        self.q = False
         self.stopping = False
         self.pp = False
         self.pstream = False
@@ -44,7 +43,7 @@ class WaveRecorder(object):
 
         self.to   = make_ogg_stream_state()
         self.page = make_ogg_page()
-        self.fout = open(WAVE_OUTPUT_FILENAME, "wb")
+        self.terminationFlag = True # this flag is used to signal recorder that it is no longer needed (when the connection is lost)
 
     def __del__(self):
         if self.stream:
@@ -79,9 +78,8 @@ class WaveRecorder(object):
 
     # make initial page of Ogg stream
     def oggStart(self):
-        quality = -0.1 # values between -0.1 (bad) to 1.0 (good)
         r1 = vorbis_info_init(self.vi)
-        r2 = vorbis_encode_init_vbr(self.vi, CHANNELS, RATE, quality)
+        r2 = vorbis_encode_init_vbr(self.vi, CHANNELS, RATE, QUALITY)
         r3 = vorbis_encode_setup_init(self.vi)
 
         r4 = vorbis_comment_init(self.vc)
@@ -101,10 +99,11 @@ class WaveRecorder(object):
 
     # purge Vorbis structures (not used yet)
     def clear(self):
-        vorbis_block_clear(self.vb)
-        vorbis_dsp_clear(self.vd)
-        vorbis_comment_clear(self.vc)
-        vorbis_info_clear(self.vi)
+        vorbis_analysis_wrote(self.vd,0)
+        while (vorbis_analysis_blockout(self.vd, self.vb) == 1):
+            vorbis_analysis(self.vb,self.audio_pkt)
+            ogg_stream_packetin(self.to,self.audio_pkt)
+        ogg_stream_pageout(self.to, self.page)
 
     # make a (middle) page of Ogg stream - this one contains multimedia data
     def savePage(self):
@@ -112,13 +111,10 @@ class WaveRecorder(object):
         if n:
             header = page_header(self.page)
             body = page_body(self.page)
-            self.fout.write(header)
-            self.fout.write(body)
-
-    def cycle(self, q=False):
-        self.q = q
-        while not self.stopping:
-            self.record()
+            self.sock.write(header) #write Ogg page header to TCP socket
+            self.sock.write(body) #write Ogg page body to TCP socket
+            self.sock.flush() # stop waiting for data - immediately send TCP packet with everything, that was put into buffer with "write" method
+            self.sock.waitForBytesWritten()
 
     def open(self, dev):
         if not self.p:
@@ -133,7 +129,6 @@ class WaveRecorder(object):
                 input=True,
                 frames_per_buffer=CHUNK,
                 input_device_index=self.device)
-        #print("* recording")
         return self.stream
 
     def record(self, dev=0):
@@ -141,11 +136,6 @@ class WaveRecorder(object):
         if stream:
             self.oggStart() # initialize Ogg stream by writing the first page
             self.readStreamToData(stream)
-            self.fout.close()
-            #self.appendHeadToData() # -- we don't use wave files and don't need this anymore
-            if self.q:
-                self.q.put(self.data)
-            #self.play()
             return True
         return False
 
@@ -160,44 +150,7 @@ class WaveRecorder(object):
         return True
 
     def readStreamToData(self, stream):
-        if RECORD_SECONDS <= 0:
+        while self.terminationFlag == False:
             self.data = stream.read(CHUNK)
-            self.addWaveFrames(self.data) # not sure if it works, because the whole program does not work for me with RECORD_SECONDS = 0 # recorded audio frames are passed to Vorbis encoder
-        else:
-            frames = []
-            for i in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
-                self.data = stream.read(CHUNK)
-                #frames.append(self.data) # -- we don't use wave files and don't need this anymore
-                self.addWaveFrames(self.data) # recorded audio frames are passed to Vorbis encoder
-            #self.data = b''.join(frames) # -- we don't use wave files and don't need this anymore
-        #print("* done recording")
-
-# -- we don't use wave files and don't need this anymore (and also "self.play" procedure)
-"""
-    def appendHeadToData(self):
-        if self.head:
-            self.data = self.head + self.data
-        else:
-            ln1 = len(self.data)
-            self.saveStreamDataToWaveFile()
-            self.loadFullDataFromFile()
-            ln2 = len(self.data)
-            head_len = ln2-ln1
-            self.head = self.data[:head_len]
-            #print "head len:", head_len, len(self.head)
-
-    def saveStreamDataToWaveFile(self):
-        wf = wave.open(WAVE_OUTPUT_FILENAME, 'wb')
-        wf.setnchannels(CHANNELS)
-        self.sample_width = self.p.get_sample_size(FORMAT)
-        wf.setsampwidth(self.sample_width)
-        wf.setframerate(RATE)
-        wf.writeframes(self.data)
-        wf.close()
-
-    def loadFullDataFromFile(self):
-        f = open(WAVE_OUTPUT_FILENAME, 'rb')
-        self.data = f.read()
-        f.close()
-        #print "start_file:", fdata
-"""
+            self.addWaveFrames(self.data) # recorded audio frames are passed to Vorbis encoder
+        self.clear()

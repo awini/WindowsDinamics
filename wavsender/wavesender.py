@@ -1,302 +1,119 @@
 # coding: utf8
 #!/usr/bin/env python
-import sys, optparse
-from PyQt4.QtGui import *
-from PyQt4.QtCore import QObject, QThread, pyqtSignal, QTimer, QObject, QDataStream, QByteArray, QIODevice, QCoreApplication
+import sys, argparse
+from threading import Thread
+from PyQt4.QtCore import QObject, QThread, pyqtSignal, QTextStream
+from PyQt4.QtGui import QApplication, QDialog, QLineEdit, QLabel
 from PyQt4.QtNetwork import QTcpServer, QTcpSocket, QHostAddress, QAbstractSocket
-from PyQt4 import uic, QtCore
-from PyQt4.QtTest import QTest
-from datetime import datetime, timedelta
 
-import codecs
+from recorder import WaveRecorder
+from socketserver import SocketServer
 
-from multiprocessing import Process, Queue
-from recorder import WaveRecorder, SEND_BYTES_SIZE
-import time
-from timewatch import TW
-from sendprocesswatch import SendProcessWatch
-from datachange import *
 
-SEND_PART_SIZE = 414
-    
-def toStrList(args):
-    for a in args:
-        yield str(a)
-    
-def debug(*args):
-    print ' '.join(list(toStrList(args)))
+class SomeServer(SocketServer):
+    def __init__(self):
+        super(SomeServer, self).__init__()
+        self.recorder_thread = False
 
-class SocketCycler(object):
-    def start(self, count=0):
-        debug("start cycles:", count)
-        self.lastNum = 0
-        self.time = datetime.now()
-        if self.sock and self.sock.state()==QAbstractSocket.ConnectedState:
-            self.doOnStart()
-        self.cycle(count)
-        self.doOnStop()
-        
-    def cycle(self, count):
-        i = 0
-        while self.sock and self.sock.state()==QAbstractSocket.ConnectedState \
-                and (i<count or count==0):
-            self.doTime(i)
-            self.run()
-            print "fin cycle", i
-            i+=1
-        
-    def doTime(self, i):
-        tm = datetime.now()
-        if tm - self.time >= timedelta(0, 1):
-            d = i - self.lastNum
-            self.lastNum = i
-            self.time = tm
-            print "d =", d
-            
-class MultiProcessSender(object):
-    def __init__(self, parent):
-        self.parent = parent
-        parent.getData = self.getData
-        parent.sendLength = self.sendLength
-        parent.sendData = self.sendData
-        self.parentPrepareRecorder = parent.prepareRecorder
-        parent.prepareRecorder = self.prepareRecorder
-        self.parentDoOnStop = parent.doOnStop
-        parent.doOnStop = self.doOnStop
-        
-    def getData(self):
-        self.parent.data = self.parent.q.get()
-        
-    def sendLength(self):
-        self.parent.write(
-            packIntToByteArray(
-                len(self.parent.data)
-            )
-        )
-        
-    def sendData(self):
-        self.write(self.parent.data, True)
-        
-    def prepareRecorder(self):
-        self.parentPrepareRecorder()        
-        self.parent.q = Queue()
-        self.parent.recorderProcess = Process(target=self.recorder.cycle, args=(self.q,))
-        self.parent.recorderProcess.start()
-        #print q.get()    # prints "[42, None, 'hello']"
-        #self.recorderProcess.join()
-        
-    def doOnStop(self):
-        self.parentDoOnStop()
-        if self.parent.recorder:
-            self.parent.recorder.stopping = True
-            
+    # Parse the request in order to find, what the client wants to do
+    def parseRequest(self):
+        d = self.sock.readAll() # read client's request from socket
 
-class WaveSender(SocketCycler):
-    def __init__(self, multiprocess=False):
-        self.recorder = False
-        if multiprocess:
-            self.multiProcessSender = MultiProcessSender(self)
-        
-    def doOnStart(self):
-        self.prepareRecorder()
-        TW.time_watch(self.read)
-        
-    def doOnStop(self):
-        self.sendFin()
-        
-    def run(self):
-        self.getData()
-        TW.time_watch(self.sendLength)
-        TW.time_watch(self.sendData)
-        
-    def prepareRecorder(self):
-        if not self.recorder:
-            self.recorder = self.recorderInit()
-        
-    def getData(self):
-        TW.time_watch(self.recorder.record)
+        # The procedure between dashes describes what command server expects,
+        # how is it parsed and what kind of response is given to client.
+        # Now for the debug purposes the server behaves as the simplest HTTP server
+        # (it can be changed later when the client part is ready)
+        # - begin -------------------------------------------------------
+        d.truncate(d.indexOf("\r\n"))                            # leave only the first line of request
+        d = d.toUpper()                                          # bring request to upper case
+        command = d.split(" ")                                   # split the first line of request into list of strings (supposed value in case of proper request: #0="GET", #1="/", #2="HTTP/1.0" (or other versions))
+        if command[0] == "GET" and command[1] == "/":            # condition for a proper request ("GET" must be the first word, "/" - the second, or all together: "GET /")
+            self.sock.write(command[2])                          # send HTTP version into socket (HTTP/1.0, HTTP/1.1, or whatever)
+            self.sock.write(" OK\r\n")                           # complete the first line of response
+            self.sock.write("Content-Type: application/ogg\r\n") # another line of response
+            self.sock.write("Cache-Control: no-cache\r\n\r\n")   # another line of response
+        # - end ---------------------------------------------------------
 
-    def sendLength(self):
-        self.write(
-            packIntToByteArray(
-                len(self.recorder.data)
-            )
-        )
+            self.sock.flush() # stop waiting for data - immediately send the packet with everything, that was put into buffer with "write" method
+            window.label_status.setText("Client connected")
+            self.recorder_thread = Thread(target=self.doRecord)
+            self.recorder_thread.start()
+            return 1
+        else:
+            return -1
 
-    def sendData(self):
-        self.write(self.recorder.data, True)
-            
-    def sendFin(self):
-        self.write(
-            packIntToByteArray(0)
-        )
-        
-    def read(self):
-        return self.sock.readAll()
-        
-    def write(self, val, withOkAnswer=False):
-        ln = self.sock.write(val)
-        while self.sock.bytesToWrite() > 0:
-            print "\twaiting..."
-            self.sock.waitForBytesWritten()
-        if withOkAnswer:
-            self.getOkAnswer()
-        return ln
-        
-    def getOkAnswer(self):
-        self.sock.waitForReadyRead()
-        d = self.sock.readAll()
-        if d=="/d":
-            print "send ok!"
-            return True
-        print "send result:", d
-        return False
+    def doRecord(self):
+        self.recorder = WaveRecorder(self.sock.socketDescriptor())
+        self.recorder.terminationFlag = False
+        self.recorder.record()
 
-if __name__=="__main__":
-    import argparse
-    import sys
+    # overrides parent class' clientWentOffline method
+    def clientWentOffline(self):
+        self.recorder.terminationFlag = True
+        self.recorder_thread.join()
+        self.sock.close()
+        window.label_status.setText("Client disconnected")
+        self.isWorking = False
 
+class WaveSenderWindow(QDialog):
+    def __init__(self, parent=None):
+        super(WaveSenderWindow, self).__init__(parent)
+        self.setupServer()
+        self.setupGui()
+
+    def setupServer(self):
+        self.server = SomeServer()
+        self.server.ip = args.ip
+        self.server.port = args.port
+        self.server.startListen()
+
+    def setupGui(self):
+        width = 185  # window width
+        height = 100 # window height
+        title = "Wave Sender" # window title
+        self.resize(width, height)
+        self.move(app.desktop().availableGeometry().width() / 2 - 250 / 2, app.desktop().availableGeometry().height() / 2 - 150 / 2) # move window to visible desktop center
+        self.setWindowTitle(title)
+
+        # input for assigning an IP-address which server listens
+        input_ip = QLineEdit(str(self.server.ip), self)
+        input_ip.resize(120, input_ip.height())
+        input_ip.move(5, 25)
+
+        # input for assigning a port which server listens
+        input_port = QLineEdit(str(self.server.port), self)
+        input_port.resize(50, input_port.height())
+        input_port.move(130, 25)
+
+        # input for assigning a port which server listens
+        label_ip = QLabel("IP-address:", self)
+        label_ip.move(10, 5)
+
+        # input for assigning a port which server listens
+        label_port = QLabel("Port:", self)
+        label_port.move(135, 5)
+
+        self.label_status = QLabel("No connection to client", self)
+        self.label_status.move(10, 80)
+
+    # perform a proper exit procedure
+    def closeEvent(self, evnt):
+        super(WaveSenderWindow, self).closeEvent(evnt)
+        if self.server.recorder_thread:
+            if self.server.recorder_thread.isAlive() == True: # check if recorder thread is running
+                self.server.recorder.terminationFlag = True # tell the recorder to stop
+                self.server.recorder_thread.join() # wait for recorder to stop
+
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('-t', '--test', dest='test', action='store_true')
-    parser.add_argument('-i', '--ip', dest='ip', action='store', default='127.0.0.1')
-    parser.add_argument('-p', '--port', dest='port', action='store', default=9999, type=int)
-    parser.add_argument('-c', '--cycles', dest='cycles', action='store', default=0, type=int)
-    parser.add_argument('-m', '--mulriprocess', dest='mulriprocess', action='store_true', default=False)
-    parser.add_argument('-r', '--real_recorder', dest='real_recorder', action='store_true')
-    parser.add_argument('-w', '--watch', dest='watch', action='store', default=True, type=int)
+    parser.add_argument('-i', '--ip', dest='ip', action='store', default='0.0.0.0')
+    parser.add_argument('-p', '--port', dest='port', action='store', default=999, type=int)
     args = parser.parse_args()
     sys.argv = sys.argv[:1]
 
-    if args.test:
-        import unittest
-        from socketserver import SocketServer
+    app = QApplication(sys.argv)
 
-        class SocketWorker(object):
-            def __init__(self, parent):
-                super(SocketWorker,self).__init__()
-                self.parent = parent
-                
-            def execute(self, sock):
-                sock.write("/d")
-                while True:
-                    ln = self.getLength(sock)
-                    if ln == 0:
-                        print "fin recieved"
-                        break
-                    self.readData(sock, ln)
-                    self.answerOk(sock)
-                    
-            def getLength(self, sock):
-                sock.waitForReadyRead()
-                ln = unpackIntFromByteArray(sock.readAll())
-                return ln
-                
-            def readData(self, sock, ln):
-                print "reading", ln
-                data = QByteArray()
-                while data.length() < ln:
-                    sock.waitForReadyRead()
-                    bytes = sock.readAll()
-                    data += bytes
-                    print "recieved", bytes.length(), "sum:", data.length()
-                self.parent.data += data
-                
-            def answerOk(self, sock):
-                sock.write("/d")
+    window = WaveSenderWindow()
+    window.show()
 
-        class TestServer(SocketServer):
-            def __init__(self, parent=None):
-                super(TestServer,self).__init__(parent)
-                print "TestServer.start"
-                self.data = QByteArray()
-                self.ip = QHostAddress(args.ip)
-                self.port = args.port
-                self.socketWorker = SocketWorker(self)
-
-            def __del__(self):
-                print "TestServer.finish"
-                
-        class TestRecorder(object):
-            def record(self):
-                data = ""
-                for a in xrange(0,4140):
-                    data += "a"
-                self.data = data
-                
-        class Test1(unittest.TestCase):
-            def setUp(self):
-                self.workWhileExists = QObject()
-                self.ts = TestServer()
-                self.ts.ip = args.ip
-                self.ts.port = args.port
-                self.thread = QThread()
-                self.ts.moveToThread(self.thread);
-                self.ts.connect(self.thread,QtCore.SIGNAL("started()"),self.ts.startListen)
-                self.ts.connect(self.ts,QtCore.SIGNAL("finished()"),self.thread.quit)
-                self.ts.connect(self.workWhileExists,QtCore.SIGNAL("destroyed()"),self.ts.stopListen)
-                self.thread.start()
-                
-                QTest.qWait(250)
-                
-                self.assertEquals(self.ts.listening, True)
-                
-            def tearDown(self):
-                self.sock.close()
-                del self.workWhileExists
-                self.workWhileExists = False
-
-                QTest.qWait(250)
-
-                self.thread.quit()
-                self.assertEquals(self.thread.wait(), True)
-
-            def test_execution(self):
-                ws = WaveSender(args.mulriprocess)
-                if args.watch == True:
-                    ws.sendProcessWatch = SendProcessWatch(ws)
-                else:
-                    def twm(func):
-                        return func()
-                    def ptw():
-                        pass
-                    TW.time_watch = twm
-                    TW.print_time_watch = ptw
-                if args.real_recorder:
-                    ws.recorderInit = WaveRecorder
-                else:
-                    ws.recorderInit = TestRecorder
-                ws.sock = QTcpSocket()
-                self.sock = ws.sock
-                print "connect to:", args.ip +":"+ str(args.port)
-                ws.sock.connectToHost(QHostAddress(args.ip), args.port)
-                self.assertEquals(ws.sock.waitForConnected(), True)
-
-                QTest.qWait(250)
-                cycles = args.cycles
-                if cycles == 0:
-                    cycles = 1
-                ws.start(cycles)
-                
-                if args.watch:
-                    self.assertEquals(ws.sendProcessWatch.recieved, "/d")
-                    self.assertEquals(ws.sendProcessWatch.sendedLens, [4L, SEND_BYTES_SIZE, 4L])
-                else:
-                    print "-- NO WATCH! --"
-                
-                TW.print_time_watch()
-
-        app = QCoreApplication(sys.argv)
-        unittest.main()
-        app.exec_()
-    else:
-        #app = QCoreApplication(sys.argv)
-        ws = WaveSender(args.mulriprocess)
-        ws.recorderInit = WaveRecorder
-        ws.sock = QTcpSocket()
-        while True:
-            ws.sock.connectToHost(QHostAddress(args.ip), args.port)
-            if ws.sock.waitForConnected():
-                print "connected"
-                break
-        ws.start(args.cycles)
-        #app.exec_()
+    app.exec_()
